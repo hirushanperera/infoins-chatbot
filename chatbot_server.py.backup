@@ -1,0 +1,220 @@
+import os
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import time
+from functools import wraps
+
+app = Flask(__name__, static_folder='.')
+CORS(app)
+
+# Rate limiting
+last_request_time = {}
+REQUEST_COOLDOWN = 1
+
+def rate_limit(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        client_ip = request.remote_addr
+        current_time = time.time()
+        
+        if client_ip in last_request_time:
+            time_since_last = current_time - last_request_time[client_ip]
+            if time_since_last < REQUEST_COOLDOWN:
+                return jsonify({'error': 'Too many requests. Please wait.'}), 429
+        
+        last_request_time[client_ip] = current_time
+        return f(*args, **kwargs)
+    return decorated_function
+
+conversations = {}
+
+@app.route('/')
+def index():
+    return send_from_directory('.', 'chatbot_interface.html')
+
+@app.route('/api/chat', methods=['POST'])
+@rate_limit
+def chat():
+    try:
+        data = request.json
+        user_message = data.get('message', '')
+        session_id = data.get('session_id', 'default')
+        
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+        
+        if session_id not in conversations:
+            conversations[session_id] = []
+        
+        conversations[session_id].append({
+            'role': 'user',
+            'content': user_message
+        })
+        
+        # Try Groq first (faster and more quota)
+        response_text = try_groq_api(conversations[session_id])
+        
+        # If Groq fails, try Google Gemini
+        if response_text is None:
+            print("Groq failed, trying Google Gemini...")
+            response_text = try_gemini_api(conversations[session_id])
+        
+        if response_text is None:
+            return jsonify({'error': 'All AI services are currently unavailable. Please try again later.'}), 500
+        
+        conversations[session_id].append({
+            'role': 'assistant',
+            'content': response_text
+        })
+        
+        return jsonify({
+            'response': response_text,
+            'session_id': session_id
+        })
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+
+def try_groq_api(conversation_history):
+    """Try using Groq API"""
+    try:
+        import requests
+        
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        if not groq_api_key:
+            print("No Groq API key found")
+            return None
+        
+        # Build messages for Groq
+        messages = [
+            {
+                "role": "system",
+                "content": get_system_instruction()
+            }
+        ]
+        
+        for msg in conversation_history:
+            messages.append({
+                "role": msg['role'] if msg['role'] == 'user' else 'assistant',
+                "content": msg['content']
+            })
+        
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {groq_api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 2000
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            print("✅ Response from Groq (Llama 3.3)")
+            return result['choices'][0]['message']['content']
+        else:
+            print(f"Groq API error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"Groq error: {str(e)}")
+        return None
+
+def try_gemini_api(conversation_history):
+    """Try using Google Gemini API"""
+    try:
+        from google import genai
+        from google.genai import types
+        
+        client = genai.Client(
+            api_key=os.environ.get("GEMINI_API_KEY"),
+        )
+        
+        contents = []
+        for msg in conversation_history:
+            role = "user" if msg['role'] == 'user' else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=msg['content'])],
+                )
+            )
+        
+        generate_content_config = types.GenerateContentConfig(
+            system_instruction=[
+                types.Part.from_text(text=get_system_instruction()),
+            ],
+        )
+        
+        response_text = ""
+        model = "gemini-2.0-flash-exp"
+        
+        for chunk in client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=generate_content_config,
+        ):
+            if chunk.text:
+                response_text += chunk.text
+        
+        print("✅ Response from Google Gemini")
+        return response_text
+        
+    except Exception as e:
+        print(f"Gemini error: {str(e)}")
+        return None
+
+@app.route('/api/clear', methods=['POST'])
+def clear_conversation():
+    try:
+        data = request.json
+        session_id = data.get('session_id', 'default')
+        
+        if session_id in conversations:
+            conversations[session_id] = []
+        
+        return jsonify({'message': 'Conversation cleared'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def get_system_instruction():
+    """Return the system instruction for the chatbot"""
+    return """You are the Infoins V4 Assistant, a professional and helpful chatbot for the Infoins V4 insurance management system.
+
+Your role:
+- Provide clear, step-by-step guidance on system features
+- Be professional but friendly
+- Use emojis occasionally (📂 🔐 👤 etc.)
+- Format responses with proper spacing and bullet points
+- Focus on Admin Module features: User Management, Group Management, Staff Management, Role Permissions, Branch Management, System Settings
+
+Always:
+- Use clear paragraphs with line breaks
+- Number steps when giving instructions
+- Highlight important terms
+- Be concise but complete
+- Assume users may not be technical experts"""
+
+if __name__ == '__main__':
+    if not os.environ.get("GROQ_API_KEY") and not os.environ.get("GEMINI_API_KEY"):
+        print("WARNING: No API keys found!")
+        print("Please set GROQ_API_KEY and/or GEMINI_API_KEY")
+    else:
+        if os.environ.get("GROQ_API_KEY"):
+            print("✅ Groq API key found!")
+        if os.environ.get("GEMINI_API_KEY"):
+            print("✅ Gemini API key found!")
+    
+    print("\n🚀 Starting Infoins V4 Chatbot Server...")
+    print("📱 Access from your computer: http://localhost:5000")
+    print("🌐 Access from other devices: http://YOUR_IP_ADDRESS:5000")
+    print("\nPress Ctrl+C to stop the server\n")
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
